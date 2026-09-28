@@ -1,0 +1,898 @@
+package com.star.schedule.notification
+
+import android.app.AlarmManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
+import android.graphics.drawable.Icon
+import android.media.AudioAttributes
+import androidx.core.graphics.drawable.IconCompat
+import android.os.Build
+import android.os.Bundle
+import android.util.Log
+import android.widget.RemoteViews
+import android.widget.Toast
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.toArgb
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.core.content.getSystemService
+import androidx.core.graphics.drawable.toBitmap
+import androidx.core.graphics.toColorInt
+import androidx.core.net.toUri
+import com.star.schedule.core.common.Constants
+import com.star.schedule.MainActivity
+import com.star.schedule.R
+import com.star.schedule.core.database.CourseEntity
+import com.star.schedule.core.database.DatabaseProvider
+import com.star.schedule.core.database.LessonTimeEntity
+import com.star.schedule.core.database.ReminderEntity
+import com.star.schedule.feature.schedule.domain.getWeekOfSemester
+import com.star.schedule.feature.timetable.domain.ReminderScheduler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.scale
+
+class UnifiedNotificationManager(private val context: Context) : ReminderScheduler {
+
+    private val notificationManager = context.getSystemService<NotificationManager>()!!
+    private val alarmManager = context.getSystemService<AlarmManager>()!!
+
+    companion object {
+        const val CHANNEL_ID = "course_reminder"
+        const val LIVE_CHANNEL_ID = "live_notification_channel"
+        const val NOTIFICATION_ID = 1001
+        private const val FINISH_NOTIFICATION_DISMISS_DELAY_MS = 5 * 60 * 1000L
+
+        // 定期更新提醒的请求码
+        const val DAILY_UPDATE_REQUEST_CODE = 9999
+    }
+
+    init {
+        createNotificationChannels()
+    }
+
+    private fun createNotificationChannels() {
+        val audioAttributes = AudioAttributes.Builder()
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+            .build()
+
+        val channelName = context.getString(R.string.channel_name_course_reminder)
+        val channelDescription = context.getString(R.string.channel_desc_course_reminder)
+        val normalChannel = NotificationChannel(
+            CHANNEL_ID,
+            channelName,
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = channelDescription
+            enableLights(true)
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0, 250, 250, 250)
+            lockscreenVisibility = NotificationCompat.VISIBILITY_PUBLIC
+            setBypassDnd(true)
+            setShowBadge(true)
+            setSound(android.provider.Settings.System.DEFAULT_NOTIFICATION_URI, audioAttributes)
+        }
+
+        val liveChannelName = context.getString(R.string.channel_name_live_notification)
+        val liveChannelDescription = context.getString(R.string.channel_desc_live_notification)
+        val liveChannel = NotificationChannel(
+            LIVE_CHANNEL_ID,
+            liveChannelName,
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = liveChannelDescription
+            enableLights(true)
+            enableVibration(true)
+            setBypassDnd(true)
+            setShowBadge(true)
+        }
+
+        notificationManager.createNotificationChannel(normalChannel)
+        notificationManager.createNotificationChannel(liveChannel)
+    }
+
+    private fun loadIconBitmap(path: String?, targetSizeDp: Int): Bitmap? {
+        if (path.isNullOrBlank()) return null
+        val file = File(path)
+        if (!file.exists()) return null
+        return runCatching {
+            val options = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+            val bitmap = BitmapFactory.decodeFile(file.absolutePath, options) ?: return null
+            val targetSize =
+                (targetSizeDp * context.resources.displayMetrics.density).toInt().coerceAtLeast(1)
+            val maxSide = maxOf(bitmap.width, bitmap.height).coerceAtLeast(1)
+            if (maxSide <= targetSize) {
+                bitmap
+            } else {
+                bitmap.scale(
+                    (bitmap.width * targetSize / maxSide).coerceAtLeast(1),
+                    (bitmap.height * targetSize / maxSide).coerceAtLeast(1)
+                )
+            }
+        }.getOrNull()
+    }
+
+    private fun loadLiveIconBitmap(path: String?): Bitmap? = loadIconBitmap(path, 96)
+
+    private fun loadSmallIconBitmap(path: String?): Bitmap? = loadIconBitmap(path, 28)
+
+    private fun tintBitmap(source: Bitmap, colorInt: Int): Bitmap {
+        val tinted = createBitmap(source.width, source.height)
+        val canvas = Canvas(tinted)
+        val paint = Paint().apply {
+            colorFilter = PorterDuffColorFilter(colorInt, PorterDuff.Mode.SRC_IN)
+            isFilterBitmap = true
+        }
+        canvas.drawBitmap(source, 0f, 0f, paint)
+        return tinted
+    }
+
+    private fun getCustomNotificationIconPath(): String? {
+        return runCatching {
+            runBlocking {
+                DatabaseProvider.dao()
+                    .getPreferenceFlow(Constants.PREF_LIVE_CAPSULE_ICON_PATH)
+                    .first()
+            }
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+
+    private fun getFlymeVersion(): Int {
+        val display = Build.DISPLAY ?: return -1
+        val regex = Regex("Flyme\\s*([0-9]+)")
+        val match = regex.find(display)
+        return match?.groupValues?.getOrNull(1)?.toIntOrNull() ?: -1
+    }
+
+    fun isFlymeLiveNotificationEnabled(context: Context): Boolean {
+        try {
+        } catch (_: java.lang.Exception) {
+            Log.d("LiveUtil", "isNotificationAllowed  error")
+        }
+        if (context.checkSelfPermission("flyme.permission.READ_NOTIFICATION_LIVE_STATE") != PackageManager.PERMISSION_GRANTED) {
+            Log.e("LiveUtil", "Missing permission: flyme.permission.READ_NOTIFICATION_LIVE_STATE")
+            return false
+        }
+        val call: Bundle? = context.contentResolver.call(
+            "content://com.android.systemui.notification.provider".toUri(),
+            "isNotificationLiveEnabled",
+            null as String?,
+            null as Bundle?
+        )
+        Log.d("LiveUtil", "result=" + call + ", context package=" + context.packageName)
+        if (call != null) {
+            val z = call.getBoolean("result", false)
+            Log.d("LiveUtil", "result1 = $z")
+            return z
+        }
+        return false
+    }
+
+    fun isLiveCapsuleCustomizationAvailable(): Boolean {
+        return Build.MANUFACTURER.equals("meizu", ignoreCase = true) &&
+                getFlymeVersion() >= 11 &&
+                isFlymeLiveNotificationEnabled(context)
+    }
+
+    fun showCourseNotificationImmediate(
+        courseName: String = context.getString(R.string.notification_course_reminder),
+        location: String = "",
+        startTime: String = "",
+        finish: Boolean
+    ) {
+        val customIconPath = getCustomNotificationIconPath()
+        if (isLiveCapsuleCustomizationAvailable()) {
+            showMeizuLiveNotification(courseName, location, startTime, finish, customIconPath)
+        } else {
+            showNormalNotification(courseName, location, startTime, finish, customIconPath)
+        }
+    }
+
+    fun cancelCourseNotification() {
+        notificationManager.cancel(NOTIFICATION_ID)
+    }
+
+    fun showCourseNotification(
+        courseName: String = context.getString(R.string.notification_course_reminder),
+        location: String = "",
+        startTime: String = ""
+    ) {
+        showCourseNotificationImmediate(courseName, location, startTime, false)
+
+        try {
+            val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+
+            val formatter = DateTimeFormatter.ofPattern("HH:mm")
+            val courseStart = LocalTime.parse(startTime, formatter)
+            val triggerTime = courseStart.atDate(LocalDate.now())
+                .atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+            val updateIntent = Intent(context, CourseNotificationUpdateReceiver::class.java).apply {
+                putExtra("course_name", courseName)
+                putExtra("course_location", location)
+                putExtra("course_time", startTime)
+            }
+
+            val updatePendingIntent = PendingIntent.getBroadcast(
+                context,
+                courseName.hashCode(),
+                updateIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            alarmManager.setExactAndAllowWhileIdle(
+                AlarmManager.RTC_WAKEUP,
+                triggerTime,
+                updatePendingIntent
+            )
+
+            Log.d("UnifiedNotification", "已设置更新通知闹钟，时间: $startTime")
+
+            // 🔹 安排“取消通知”闹钟（课程开始后5分钟触发）
+            val cancelIntent = Intent(context, CourseNotificationCancelReceiver::class.java)
+            val cancelPendingIntent = PendingIntent.getBroadcast(
+                context,
+                (courseName + "_cancel").hashCode(),
+                cancelIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            alarmManager.setExactAndAllowWhileIdle(
+                AlarmManager.RTC_WAKEUP,
+                triggerTime + FINISH_NOTIFICATION_DISMISS_DELAY_MS,
+                cancelPendingIntent
+            )
+
+            Log.d("UnifiedNotification", "已设置取消通知闹钟，延迟5分钟触发")
+
+        } catch (e: Exception) {
+            Log.e("UnifiedNotification", "设置更新/取消闹钟失败", e)
+        }
+    }
+
+
+    private fun showMeizuLiveNotification(
+        courseName: String,
+        location: String,
+        startTime: String,
+        finish: Boolean,
+        customIconPath: String?
+    ) {
+        // 获取数据库实例
+        val dao = DatabaseProvider.dao()
+
+        // 获取用户配置：背景色与模板
+        val (capsuleBgColor, template, iconPath) = runBlocking {
+            val colorPref = dao.getPreferenceFlow(Constants.PREF_LIVE_CAPSULE_BG_COLOR).first()
+            val templatePref = dao.getPreferenceFlow(Constants.PREF_FLYME_LIVE_TEMPLATE).first()
+            val customIconPref =
+                customIconPath
+                    ?: dao.getPreferenceFlow(Constants.PREF_LIVE_CAPSULE_ICON_PATH).first()
+            Triple(
+                colorPref ?: "#FFE082",
+                FlymeLiveTemplate.fromPref(templatePref),
+                customIconPref?.takeIf { it.isNotBlank() }
+            )
+        }
+        fun autoContentColorFor(background: Color): Color {
+            return if (background.luminance() > 0.7f) Color.Black else Color.White
+        }
+
+        val textColor = autoContentColorFor(Color(capsuleBgColor.toColorInt()))
+        val textColorInt = textColor.toArgb()
+        val customCapsuleIconBitmap = loadLiveIconBitmap(iconPath)?.let { src ->
+            tintBitmap(src, textColorInt)
+        }
+        val defaultIconBitmap =
+            ContextCompat.getDrawable(context, R.drawable.ic_notification)?.mutate()
+                ?.let { drawable ->
+                    drawable.setTint(textColorInt)
+                    drawable.toBitmap()
+                }
+        val capsuleIconBitmap = customCapsuleIconBitmap ?: defaultIconBitmap
+        val customSmallIconBitmap = iconPath?.let { path ->
+            loadSmallIconBitmap(path)?.let { tintBitmap(it, android.graphics.Color.WHITE) }
+        }
+
+        val capsuleBundle = Bundle().apply {
+            putInt("notification.live.capsuleStatus", 1)
+            putInt("notification.live.capsuleType", 3)
+            putString("notification.live.capsuleContent", location)
+
+            capsuleIconBitmap?.let { iconBitmap ->
+                val icon = Icon.createWithBitmap(iconBitmap)
+                putParcelable("notification.live.capsuleIcon", icon)
+            }
+            putInt("notification.live.capsuleBgColor", capsuleBgColor.toColorInt())
+            putInt("notification.live.capsuleContentColor", textColor.toArgb())
+        }
+
+        val liveBundle = Bundle().apply {
+            putBoolean("is_live", true)
+            putInt("notification.live.operation", 0)
+            putInt("notification.live.type", 10)
+            putBundle("notification.live.capsule", capsuleBundle)
+            putInt("notification.live.contentColor", textColor.toArgb())
+        }
+
+        val layoutRes = if (finish) template.finishedLayout else template.ongoingLayout
+        val layout = RemoteViews(context.packageName, layoutRes)
+
+        val contentRemoteViews =
+            layout.apply {
+                setTextViewText(R.id.live_title, courseName)
+                setTextViewText(R.id.location, location)
+                setTextViewText(R.id.live_time, startTime)
+                when {
+                    capsuleIconBitmap != null -> setImageViewBitmap(
+                        R.id.live_icon,
+                        loadLiveIconBitmap(iconPath)
+                    )
+                    else -> setImageViewResource(R.id.live_icon, R.drawable.star)
+                }
+            }
+
+        val notificationBuilder = Notification.Builder(context, LIVE_CHANNEL_ID)
+            .setContentTitle(courseName)
+            .setContentText(location)
+            .addExtras(liveBundle)
+            .setCustomContentView(contentRemoteViews)
+            .setAutoCancel(false)
+
+        customSmallIconBitmap?.let { smallIcon ->
+            notificationBuilder.setSmallIcon(Icon.createWithBitmap(smallIcon))
+        } ?: notificationBuilder.setSmallIcon(R.drawable.ic_notification)
+
+        val notification = notificationBuilder.build()
+
+        notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    private fun showNormalNotification(
+        courseName: String,
+        location: String,
+        startTime: String,
+        finish: Boolean,
+        customIconPath: String?
+    ) {
+        val reminderLabel = context.getString(R.string.notification_course_reminder)
+        val launchIntent = Intent(context, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            0, launchIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val contentText = if (finish) {
+            if (location.isNotEmpty()) {
+                context.getString(
+                    R.string.notification_finished_with_location,
+                    startTime,
+                    location
+                )
+            } else {
+                context.getString(R.string.notification_finished, startTime)
+            }
+        } else {
+            if (location.isNotEmpty()) {
+                context.getString(
+                    R.string.notification_upcoming_with_location,
+                    startTime,
+                    location
+                )
+            } else {
+                context.getString(R.string.notification_upcoming, startTime)
+            }
+        }
+
+        val customSmallIconBitmap = customIconPath?.let { path ->
+            loadSmallIconBitmap(path)?.let { tintBitmap(it, android.graphics.Color.WHITE) }
+        }
+
+        val notification = NotificationCompat.Builder(context, CHANNEL_ID).apply {
+            if (customSmallIconBitmap != null) {
+                setSmallIcon(IconCompat.createWithBitmap(customSmallIconBitmap))
+            } else {
+                setSmallIcon(R.drawable.ic_notification)
+            }
+            setContentTitle(
+                context.getString(
+                    R.string.notification_title_template,
+                    courseName,
+                    reminderLabel
+                )
+            )
+            setContentText(contentText)
+            setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    if (startTime.isNotEmpty()) {
+                        context.getString(
+                            R.string.notification_big_text_with_time,
+                            contentText,
+                            startTime
+                        )
+                    } else {
+                        contentText
+                    }
+                )
+            )
+            setContentIntent(pendingIntent)
+            setAutoCancel(false)
+            setPriority(NotificationCompat.PRIORITY_MAX)
+            setCategory(NotificationCompat.CATEGORY_REMINDER)
+            setDefaults(NotificationCompat.DEFAULT_ALL)
+            setVibrate(longArrayOf(0, 250, 250, 250))
+            setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            setShortCriticalText(location)
+            setOngoing(true)
+            setRequestPromotedOngoing(true)
+        }.build()
+
+        notificationManager.notify(NOTIFICATION_ID, notification)
+    }
+
+    override suspend fun enableRemindersForTimetable(timetableId: Long) {
+        val dao = DatabaseProvider.dao()
+        dao.setPreference(Constants.PREF_REMINDER_ENABLED_TIMETABLE, timetableId.toString())
+
+        cancelAllReminders()
+        scheduleRemindersForTimetable(timetableId)
+    }
+
+    suspend fun disableReminders() {
+        val dao = DatabaseProvider.dao()
+        dao.setPreference(Constants.PREF_REMINDER_ENABLED_TIMETABLE, "")
+        cancelAllReminders()
+    }
+
+    private suspend fun scheduleRemindersForTimetable(timetableId: Long) {
+        val dao = DatabaseProvider.dao()
+        val timetable = dao.getTimetableFlow(timetableId).first() ?: return
+        val courses = dao.getCoursesFlow(timetableId).first()
+        val lessonTimes = dao.getLessonTimesFlow(timetableId).first()
+
+        // 检查是否只在连续课程的第一节课前发送通知
+        val notifyOnlyForFirstContinuousClassPref =
+            dao.getPreferenceFlow(Constants.PREF_NOTIFY_ONLY_FOR_FIRST_CONTINUOUS_CLASS).first()
+        val notifyOnlyForFirstContinuousClass = notifyOnlyForFirstContinuousClassPref == "true"
+
+        val startDate =
+            runCatching { LocalDate.parse(timetable.startDate) }.getOrElse { LocalDate.now() }
+        val currentDate = LocalDate.now()
+        val endDate = currentDate.plusWeeks(2)
+
+        var date = currentDate
+        while (!date.isAfter(endDate)) {
+            val weekNumber = date.getWeekOfSemester(startDate)
+            val dayOfWeek = date.dayOfWeek.value
+            val todayCourses =
+                courses.filter { it.dayOfWeek == dayOfWeek && it.weeks.contains(weekNumber) }
+
+            todayCourses.forEach { course ->
+                course.periods.forEach { period ->
+                    // 如果启用了"只在连续课程的第一节课前发送通知"，则需要检查当前课程是否是连续课程的第一节
+                    if (notifyOnlyForFirstContinuousClass) {
+                        // 检查是否有与当前课程连续的前一节课
+                        val previousContinuousClass = todayCourses.find { c ->
+                            c.periods.contains(period - 1)
+                        }
+
+                        // 如果有连续的前一节课，并且是同一门课（课程名称和地点都相同），则不为当前课程设置提醒
+                        if (previousContinuousClass != null &&
+                            previousContinuousClass.name == course.name &&
+                            previousContinuousClass.location == course.location
+                        ) {
+                            Log.d(
+                                "UnifiedNotification",
+                                "跳过同一门连续课程的后续课程提醒: ${course.name}, 节数: $period"
+                            )
+                            return@forEach
+                        }
+                    }
+
+                    val lessonTime = lessonTimes.find { it.period == period }
+                    if (lessonTime != null) {
+                        scheduleReminderForCourse(course, lessonTime, date, timetable.reminderTime)
+                    }
+                }
+            }
+            date = date.plusDays(1)
+        }
+    }
+
+    private fun scheduleReminderForCourse(
+        course: CourseEntity,
+        lessonTime: LessonTimeEntity,
+        date: LocalDate,
+        reminderTime: Int = 15
+    ) {
+        val startTime = LocalTime.parse(lessonTime.startTime, DateTimeFormatter.ofPattern("HH:mm"))
+        val courseDateTime = LocalDateTime.of(date, startTime)
+        val reminderDateTime = courseDateTime.minusMinutes(reminderTime.toLong())
+
+        if (reminderDateTime.isAfter(LocalDateTime.now())) {
+            val intent = Intent(context, CourseReminderReceiver::class.java).apply {
+                putExtra("course_name", course.name)
+                putExtra("course_location", course.location)
+                putExtra("course_time", lessonTime.startTime)
+            }
+
+            val requestCode = generateRequestCode(course.id, date, lessonTime.period)
+            val pendingIntent = PendingIntent.getBroadcast(
+                context,
+                requestCode,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            val triggerTime =
+                reminderDateTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+            try {
+
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.RTC_WAKEUP,
+                    triggerTime,
+                    pendingIntent
+                )
+
+                // ⚡️ 存储提醒记录
+                CoroutineScope(Dispatchers.IO).launch {
+                    DatabaseProvider.dao().insertReminder(
+                        ReminderEntity(requestCode, course.id, date.toString(), lessonTime.period)
+                    )
+                }
+            } catch (_: SecurityException) {
+                CoroutineScope(Dispatchers.Main).launch {
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.exact_alarm_setup_failed),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+
+    // ⚡️ 精确取消
+    private suspend fun cancelAllReminders() {
+        val reminders = DatabaseProvider.dao().getAllReminders()
+        reminders.forEach { reminder ->
+            val intent = Intent(context, CourseReminderReceiver::class.java)
+            val pendingIntent = PendingIntent.getBroadcast(
+                context,
+                reminder.requestCode,
+                intent,
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+            )
+            if (pendingIntent != null) {
+                alarmManager.cancel(pendingIntent)
+                pendingIntent.cancel()
+            }
+        }
+        DatabaseProvider.dao().deleteAllReminders()
+        Log.d("UnifiedNotification", "已取消 ${reminders.size} 个提醒")
+    }
+
+    private fun generateRequestCode(courseId: Long, date: LocalDate, period: Int): Int =
+        ("$courseId${date.toEpochDay()}$period").hashCode().and(0x7FFFFFFF)
+
+    fun sendTestNotification() {
+        val startTime = LocalTime.now().plusMinutes(1)
+            .format(DateTimeFormatter.ofPattern("HH:mm"))
+
+        showCourseNotification(
+            courseName = context.getString(R.string.notification_test_course),
+            location = context.getString(R.string.notification_test_location),
+            startTime = startTime,
+        )
+
+        CoroutineScope(Dispatchers.Main).launch {
+            Toast.makeText(
+                context,
+                context.getString(R.string.notification_test_scheduled),
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
+    fun scheduleTestReminder() {
+        val startTime = LocalTime.now().plusMinutes(1)
+            .format(DateTimeFormatter.ofPattern("HH:mm"))
+
+        val intent = Intent(context, CourseReminderReceiver::class.java).apply {
+            putExtra("course_name", context.getString(R.string.notification_test_course))
+            putExtra("course_location", context.getString(R.string.notification_test_location))
+            putExtra("course_time", startTime)
+        }
+
+        val requestCode = "test_reminder_${System.currentTimeMillis()}".hashCode().and(0x7FFFFFFF)
+        val pendingIntent = PendingIntent.getBroadcast(
+            context,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val triggerTime = System.currentTimeMillis() + 10 * 1000L
+
+        try {
+            if (alarmManager.canScheduleExactAlarms()) {
+                alarmManager.setExactAndAllowWhileIdle(
+                    AlarmManager.RTC_WAKEUP,
+                    triggerTime,
+                    pendingIntent
+                )
+
+                CoroutineScope(Dispatchers.Main).launch {
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.reminder_test_scheduled),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } else {
+                // 如果无法设置精确闹钟，引导用户开启权限
+                val settingsIntent =
+                    Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(settingsIntent)
+                CoroutineScope(Dispatchers.Main).launch {
+                    Toast.makeText(
+                        context,
+                        context.getString(R.string.exact_alarm_permission_required),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        } catch (_: SecurityException) {
+            CoroutineScope(Dispatchers.Main).launch {
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.reminder_setup_failed),
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+    // 保留 isReminderEnabledForTimetableSync
+    fun isReminderEnabledForTimetableSync(timetableId: Long): Boolean {
+        return try {
+            val dao = DatabaseProvider.dao()
+            runBlocking {
+                val enabledTimetableId =
+                    dao.getPreferenceFlow(Constants.PREF_REMINDER_ENABLED_TIMETABLE).first()
+                enabledTimetableId == timetableId.toString()
+            }
+        } catch (e: Exception) {
+            Log.e("UnifiedNotification", "检查提醒状态失败", e)
+            false
+        }
+    }
+
+    /**
+     * 在应用启动时检查并更新提醒
+     * 这个方法应该在 MainActivity.onCreate() 中调用
+     */
+    suspend fun initializeOnAppStart() {
+        try {
+            Log.d("UnifiedNotification", "应用启动，初始化提醒系统")
+
+            // 检查是否有启用的课表提醒
+            val dao = DatabaseProvider.dao()
+            val enabledTimetableId =
+                dao.getPreferenceFlow(Constants.PREF_REMINDER_ENABLED_TIMETABLE).first()
+
+            enabledTimetableId?.let { idString ->
+                if (idString.isNotEmpty()) {
+                    val timetableId = idString.toLongOrNull()
+                    if (timetableId != null) {
+                        Log.d("UnifiedNotification", "检测到启用的课表提醒: $timetableId")
+
+                        // 检查并更新过期的提醒
+                        cleanupExpiredReminders()
+
+                        // 重新设置提醒（以防系统清理或其他原因导致丢失）
+                        scheduleRemindersForTimetable(timetableId)
+
+                        // 设置定期更新机制
+                        scheduleDailyUpdate()
+
+                        Log.d("UnifiedNotification", "提醒系统初始化完成")
+                    }
+                }
+            } ?: Log.d("UnifiedNotification", "未检测到启用的课表提醒")
+        } catch (e: Exception) {
+            Log.e("UnifiedNotification", "初始化提醒系统失败", e)
+        }
+    }
+
+    /**
+     * 设备重启后恢复提醒
+     */
+    suspend fun restoreRemindersAfterBoot() {
+        try {
+            Log.d("UnifiedNotification", "设备重启，恢复提醒设置")
+
+            // 确保数据库已初始化
+            if (!DatabaseProvider.isInitialized()) {
+                DatabaseProvider.init(context)
+            }
+
+            val dao = DatabaseProvider.dao()
+            val enabledTimetableId =
+                dao.getPreferenceFlow(Constants.PREF_REMINDER_ENABLED_TIMETABLE).first()
+
+            enabledTimetableId?.let { idString ->
+                if (idString.isNotEmpty()) {
+                    val timetableId = idString.toLongOrNull()
+                    if (timetableId != null) {
+                        Log.d("UnifiedNotification", "重启后恢复课表提醒: $timetableId")
+
+                        // 清理数据库中的记录（因为重启后所有闹钟都会被清除）
+                        dao.deleteAllReminders()
+
+                        // 重新设置所有提醒
+                        scheduleRemindersForTimetable(timetableId)
+
+                        // 重新设置定期更新
+                        scheduleDailyUpdate()
+
+                        Log.d("UnifiedNotification", "重启后提醒恢复完成")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("UnifiedNotification", "重启后恢复提醒失败", e)
+        }
+    }
+
+    /**
+     * 定期更新即将到期的提醒
+     * 清理过期提醒，添加新的提醒
+     */
+    suspend fun updateUpcomingReminders() {
+        try {
+            Log.d("UnifiedNotification", "开始定期更新提醒")
+
+            val dao = DatabaseProvider.dao()
+            val enabledTimetableId =
+                dao.getPreferenceFlow(Constants.PREF_REMINDER_ENABLED_TIMETABLE).first()
+
+            enabledTimetableId?.let { idString ->
+                if (idString.isNotEmpty()) {
+                    val timetableId = idString.toLongOrNull()
+                    if (timetableId != null) {
+                        // 清理过期的提醒
+                        cleanupExpiredReminders()
+
+                        // 重新设置未来两周的提醒
+                        scheduleRemindersForTimetable(timetableId)
+
+                        Log.d("UnifiedNotification", "定期更新提醒完成")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("UnifiedNotification", "定期更新提醒失败", e)
+        }
+    }
+
+    /**
+     * 设置定期更新机制
+     * 每天凌晨2点执行一次更新
+     */
+    private fun scheduleDailyUpdate() {
+        try {
+            val intent = Intent(context, DailyUpdateReceiver::class.java)
+            val pendingIntent = PendingIntent.getBroadcast(
+                context,
+                DAILY_UPDATE_REQUEST_CODE,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            // 计算下一次凌晨2点的时间
+            val now = LocalDateTime.now()
+            val next2AM = if (now.hour < 2) {
+                now.toLocalDate().atTime(2, 0)
+            } else {
+                now.toLocalDate().plusDays(1).atTime(2, 0)
+            }
+
+            val triggerTime = next2AM.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+            if (alarmManager.canScheduleExactAlarms()) {
+                // 先取消已存在的闹钟，防止重复设置
+                alarmManager.cancel(pendingIntent)
+
+                // 设置重复的闹钟，每24小时执行一次
+                alarmManager.setRepeating(
+                    AlarmManager.RTC_WAKEUP,
+                    triggerTime,
+                    AlarmManager.INTERVAL_DAY,
+                    pendingIntent
+                )
+
+                Log.d("UnifiedNotification", "已设置定期更新，下次执行: $next2AM")
+            } else {
+                Log.w("UnifiedNotification", "无法设置精确闹钟，跳过定期更新设置")
+            }
+        } catch (e: Exception) {
+            Log.e("UnifiedNotification", "设置定期更新失败", e)
+        }
+    }
+
+    /**
+     * 清理过期的提醒
+     */
+    private suspend fun cleanupExpiredReminders() {
+        try {
+            val dao = DatabaseProvider.dao()
+            val allReminders = dao.getAllReminders()
+            val currentDate = LocalDate.now()
+
+            val expiredReminders = allReminders.filter { reminder ->
+                val reminderDate = LocalDate.parse(reminder.date)
+                reminderDate.isBefore(currentDate)
+            }
+
+            // 取消过期的闹钟
+            expiredReminders.forEach { reminder ->
+                val intent = Intent(context, CourseReminderReceiver::class.java)
+                val pendingIntent = PendingIntent.getBroadcast(
+                    context,
+                    reminder.requestCode,
+                    intent,
+                    PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+                )
+                if (pendingIntent != null) {
+                    alarmManager.cancel(pendingIntent)
+                    pendingIntent.cancel()
+                }
+
+                // 从数据库中删除
+                dao.deleteReminder(reminder.requestCode)
+            }
+
+            if (expiredReminders.isNotEmpty()) {
+                Log.d("UnifiedNotification", "已清理 ${expiredReminders.size} 个过期提醒")
+            }
+        } catch (e: Exception) {
+            Log.e("UnifiedNotification", "清理过期提醒失败", e)
+        }
+    }
+
+}
